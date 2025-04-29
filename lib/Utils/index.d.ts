@@ -13,7 +13,6 @@ export * from './auth-utils';
 export * from './baileys-event-stream';
 export * from './use-multi-file-auth-state';
 export * from './use-mongodb-auth-state';
-export * from './use-sqlite-auth-state';
 export * from './link-preview';
 export * from './event-buffer';
 export * from './process-message';
