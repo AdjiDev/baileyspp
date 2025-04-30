@@ -1,115 +1,168 @@
+import { MongoClient, Db, Collection } from 'mongodb';
 import { proto } from '../../WAProto';
-import { AuthenticationState, AuthenticationCreds } from '../Types';
 import { initAuthCreds } from './auth-utils';
 import { BufferJSON } from './generics';
-import { MongoClient, Collection, WithId, Document } from 'mongodb';
 
-/**
- * Document structure for MongoDB storage
- */
-interface AuthStateDocument extends Document {
-    key: string;
-    data: any;
-    updatedAt?: Date;
+export interface MongoDBAuthConfig {
+  mongoUri: string;
+  dbName: string;
+  collectionName?: string;
 }
 
-export interface MongoDBAuthStateConfig {
-    mongoUri: string;
-    dbName: string;
-    collectionName?: string;
+export interface AuthState {
+  creds: any;
+  keys: {
+    get: (type: string, ids: string[]) => Promise<{ [id: string]: any }>;
+    set: (data: { [category: string]: { [id: string]: any } }) => Promise<void>;
+  };
 }
 
-export interface MongoDBAuthState {
-    state: AuthenticationState;
-    saveCreds: () => Promise<void>;
-    close: () => Promise<void>;
-}
-
-/**
- * Creates a MongoDB-based authentication state store for WhatsApp
- * @param config MongoDB configuration
- * @returns Promise resolving to authentication state and management functions
- */
 export const useMongoDBAuthState = async (
-    config: MongoDBAuthStateConfig | string,
-    dbName?: string,
-    collectionName: string = 'whatsapp_auth'
-): Promise<MongoDBAuthState> => {
-    const mongoUri = typeof config === 'string' ? config : config.mongoUri;
-    const finalDbName = typeof config === 'string' ? dbName : config.dbName;
-    const finalCollectionName = typeof config === 'string' ? collectionName : config.collectionName || 'whatsapp_auth';
+  config: string | MongoDBAuthConfig,
+  dbName?: string,
+  collectionName: string = 'whatsapp_auth'
+): Promise<{
+  state: AuthState;
+  saveCreds: () => Promise<void>;
+  close: () => Promise<void>;
+}> => {
+  const mongoUri = typeof config === 'string' ? config : config.mongoUri;
+  const finalDbName = typeof config === 'string' ? dbName : config.dbName;
+  const finalCollectionName = typeof config === 'string' ? collectionName : config.collectionName || 'whatsapp_auth';
 
-    if (!mongoUri) throw new Error('MongoDB URI is required');
-    if (!finalDbName) throw new Error('Database name is required');
+  if (!mongoUri) throw new Error('MongoDB URI is required');
+  if (!finalDbName) throw new Error('Database name is required');
 
-    const client = new MongoClient(mongoUri);
+  const client = new MongoClient(mongoUri, {
+    retryWrites: true,
+    retryReads: true,
+    connectTimeoutMS: 10000,
+    socketTimeoutMS: 30000,
+    serverSelectionTimeoutMS: 5000,
+    maxPoolSize: 10,
+    minPoolSize: 1,
+  });
+
+  try {
     await client.connect();
-    const db = client.db(finalDbName);
-    const collection = db.collection<AuthStateDocument>(finalCollectionName);
+  } catch (error: any) {
+    throw new Error(`Failed to connect to MongoDB: ${error.message}`);
+  }
 
+  const db: Db = client.db(finalDbName);
+  const collection: Collection = db.collection(finalCollectionName);
+
+  try {
     await collection.createIndex({ key: 1 }, { unique: true });
+  } catch (error: any) {
+    if (error.code !== 85) {
+      console.warn('Failed to create index:', error.message);
+    }
+  }
 
-    const writeData = async (data: any, key: string): Promise<void> => {
+  const writeData = async (data: any, key: string) => {
+    try {
+      await collection.updateOne(
+        { key },
+        {
+          $set: {
+            data: JSON.parse(JSON.stringify(data, BufferJSON.replacer)),
+            updatedAt: new Date(),
+          },
+        },
+        { upsert: true }
+      );
+    } catch (error: any) {
+      if (error.code === 11000) {
         await collection.updateOne(
-            { key },
-            { 
-                $set: { 
-                    data: JSON.parse(JSON.stringify(data, BufferJSON.replacer)),
-                    updatedAt: new Date() 
-                } 
+          { key },
+          {
+            $set: {
+              data: JSON.parse(JSON.stringify(data, BufferJSON.replacer)),
+              updatedAt: new Date(),
             },
-            { upsert: true }
+          }
         );
-    };
+      } else {
+        throw error;
+      }
+    }
+  };
 
-    const readData = async <T = any>(key: string): Promise<T | null> => {
-        const doc = await collection.findOne({ key });
-        if (!doc?.data) return null;
-        return JSON.parse(JSON.stringify(doc.data), BufferJSON.reviver) as T;
-    };
+  const readData = async (key: string): Promise<any | null> => {
+    try {
+      const doc = await collection.findOne({ key });
+      if (!doc?.data) return null;
+      return JSON.parse(JSON.stringify(doc.data), BufferJSON.reviver);
+    } catch (error: any) {
+      console.error('Error reading data:', error);
+      return null;
+    }
+  };
 
-    const removeData = async (key: string): Promise<void> => {
-        await collection.deleteOne({ key });
-    };
+  const removeData = async (key: string): Promise<void> => {
+    try {
+      await collection.deleteOne({ key });
+    } catch (error: any) {
+      console.error('Error removing data:', error);
+    }
+  };
 
-    const creds = (await readData<AuthenticationCreds>('creds')) || initAuthCreds();
+  let creds;
+  try {
+    creds = (await readData('creds')) || initAuthCreds();
+  } catch (error: any) {
+    console.error('Error initializing credentials:', error);
+    creds = initAuthCreds();
+  }
 
-    return {
-        state: {
-            creds,
-            keys: {
-                get: async (type, ids) => {
-                    const data: { [id: string]: any } = {};
-                    await Promise.all(
-                        ids.map(async (id) => {
-                            const key = `${type}-${id}`;
-                            let value = await readData(key);
-                            if (type === 'app-state-sync-key' && value) {
-                                value = proto.Message.AppStateSyncKeyData.fromObject(value);
-                            }
-                            data[id] = value;
-                        })
-                    );
-                    return data;
-                },
-                set: async (data) => {
-                    const tasks: Promise<void>[] = [];
-                    for (const category in data) {
-                        for (const id in data[category]) {
-                            const value = data[category][id];
-                            const key = `${category}-${id}`;
-                            tasks.push(value ? writeData(value, key) : removeData(key));
-                        }
-                    }
-                    await Promise.all(tasks);
-                },
-            },
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type: string, ids: string[]): Promise<{ [id: string]: any }> => {
+          const data: { [id: string]: any } = {};
+          await Promise.all(
+            ids.map(async (id) => {
+              try {
+                const key = `${type}-${id}`;
+                let value = await readData(key);
+                if (type === 'app-state-sync-key' && value) {
+                  value = proto.Message.AppStateSyncKeyData.fromObject(value);
+                }
+                data[id] = value;
+              } catch (error: any) {
+                console.error(`Error getting key ${type}-${id}:`, error);
+                data[id] = null;
+              }
+            })
+          );
+          return data;
         },
-        saveCreds: () => writeData(creds, 'creds'),
-        close: async () => {
-            await client.close();
+        set: async (data: { [category: string]: { [id: string]: any } }): Promise<void> => {
+          const tasks: Promise<void>[] = [];
+          for (const category in data) {
+            for (const id in data[category]) {
+              const value = data[category][id];
+              const key = `${category}-${id}`;
+              tasks.push(
+                value
+                  ? writeData(value, key).catch((e) => console.error(`Error writing ${key}:`, e))
+                  : removeData(key).catch((e) => console.error(`Error removing ${key}:`, e))
+              );
+            }
+          }
+          await Promise.all(tasks);
         },
-    };
+      },
+    },
+    saveCreds: () => writeData(creds, 'creds').catch((e) => console.error('Error saving credentials:', e)),
+    close: async () => {
+      try {
+        await client.close();
+      } catch (error: any) {
+        console.error('Error closing MongoDB connection:', error);
+      }
+    },
+  };
 };
-
-export type { AuthenticationState, AuthenticationCreds };
